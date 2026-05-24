@@ -8,7 +8,7 @@
 
 A high-performance, multi-layer Web Application Firewall (WAF) for WordPress sites running on OpenResty with Cloudflare CDN. Features adaptive defense mechanisms, Redis-powered risk scoring, intelligent rate limiting, and automatic global mode switching.
 
-> **Note:** Code and configuration comments are primarily in Chinese. This document provides full English documentation. For Chinese, see [README_zh.md](README_zh.md).
+> **Note:** Code and configuration comments are primarily in Chinese. This document provides full English documentation. For Chinese, see [README.md](README.md).
 
 ---
 
