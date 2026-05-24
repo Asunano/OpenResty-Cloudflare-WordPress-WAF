@@ -11,6 +11,9 @@ A high-performance, multi-layer Web Application Firewall (WAF) for WordPress sit
 > **Note:** Code and configuration comments are primarily in Chinese. This document provides full English documentation. For Chinese, see [README.md](README.md).
 
 ---
+> ⚠️ **Important Security Notice**
+> This script is currently maintained and used only by the author personally. It **has NOT been validated in large-scale production environments, audited by third-party security teams, or fully tested under real attack scenarios**.
+> Please **thoroughly test and evaluate risks before deploying to production**. The author is not responsible for any issues caused by direct usage.
 
 ## Table of Contents
 
@@ -844,6 +847,8 @@ Contributions are welcome! Please submit Issues and Pull Requests.
 5. Create a Pull Request
 
 If you discover a security vulnerability, please report it privately rather than opening a public Issue.
+
+Send it to mxianos32@gmail.com or mxianos32@qq.com
 
 ---
 
