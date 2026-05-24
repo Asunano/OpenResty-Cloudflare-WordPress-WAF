@@ -9,7 +9,7 @@
 一款专为运行在 OpenResty + Cloudflare CDN 上的 WordPress 站点设计的高性能多层 Web 应用防火墙。具备自适应防御机制、Redis 驱动的风险评分、智能速率限制和自动全局模式切换功能。
 
 > **说明**：本项目代码及配置注释主要为中文。本文档为纯中文文档，英文文档请见 [README_en.md](README_en.md)。
-
+> **Note**: This project's code and configuration comments are primarily in Chinese. This document is written entirely in Chinese; for the English version, please see [README_en.md](README_en.md)。
 ---
 
 ## 目录
