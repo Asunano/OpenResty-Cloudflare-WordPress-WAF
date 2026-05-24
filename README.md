@@ -10,6 +10,9 @@
 
 > **Note**: This project's code and configuration comments are primarily in Chinese. This document is written entirely in Chinese; for the English version, please see [README_en.md](README_en.md)。
 ---
+> ⚠️ **重要安全声明**
+> 本脚本目前仅为作者个人使用与维护，**未经过大规模生产环境验证、第三方安全审计及全面攻防测试**，安全性、稳定性与兼容性尚未达到100%严谨标准。
+> 若需部署到生产环境，请务必**自行充分测试、评估风险后谨慎使用**，因直接使用造成的任何问题，作者不承担相关责任。
 
 ## 目录
 
@@ -843,6 +846,8 @@ ngx.say("最后白名单刷新时间: ", status.last_whitelist_reload)
 5. 创建 Pull Request
 
 如果你发现安全问题，请通过私下渠道报告，而非创建公开 Issue。
+
+我的联系邮箱：mxianos32@gmail.com or mxianos32@qq.com
 
 ---
 
