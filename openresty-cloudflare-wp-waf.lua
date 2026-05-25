@@ -44,6 +44,8 @@ local redis_connect
 local redis_close
 local has_malicious_params_safe
 local bump_counter   -- 前向声明：logged_in_user_baseline_check 中需要速率限制
+-- EVALSHA 脚本缓存：init_worker 预加载 SHA，避免每次请求发送完整脚本(~5.5KB)
+local sha_cache = {}
 local function calculate_redis_pool_size()
     local worker_count = get_worker_count()
     if not worker_count or worker_count <= 0 then
@@ -1177,10 +1179,13 @@ local EVENT_NAMES_CN = {
     ["HIGH_RISK_REDIS_CHECK"] = "高风险触发Redis检测",
     ["LOW_RISK_SAMPLED"] = "低风险采样放行",
     ["ACCESS_EVAL_FAILED"] = "访问评估Redis失败",
+    ["ACCESS_EVAL_EXCEPTION"] = "访问评估脚本异常",
     ["FEEDBACK_EVAL_FAILED"] = "反馈评估Redis失败",
+    ["FEEDBACK_EVAL_EXCEPTION"] = "反馈评估脚本异常",
     -- 技术事件
     ["REGEX_PCALL_FAILED"] = "正则匹配异常",
     ["CLUSTER_SCRIPT_FAILED"] = "集群检测脚本失败",
+    ["CLUSTER_SCRIPT_EXCEPTION"] = "集群检测脚本异常",
     ["COUNTER_INCR_FAILED"] = "计数器递增失败",
     ["COUNTER_GET_FAILED"] = "计数器读取失败",
     ["COUNTER_SET_FAILED"] = "计数器设置失败",
@@ -1298,9 +1303,9 @@ local function is_logged_user()
         return true
     end
 
-    -- 低信任度的标识（仅表示评论者或购物车，不视为已登录管理员）
-    return cookies:find("comment_author_", 1, true) ~= nil
-        or cookies:find("woocommerce_items_in_cart", 1, true) ~= nil
+    -- comment_author_ / woocommerce_items_in_cart 仅为评论者/购物车标识，无签名验证，
+    -- 攻击者可轻易伪造以绕过 WAF 检测，仅 wordpress_logged_in_ / wordpress_sec_ 视为已登录
+    return false
 end
 local function fully_decode(str)
     if not str or str == "" then
@@ -1313,7 +1318,11 @@ local function fully_decode(str)
 
     while prev ~= str and iterations < max_iterations do
         prev = str
-        str = ngx.unescape_uri(str)
+        local ok, decoded = pcall(ngx.unescape_uri, str)
+        if not ok or not decoded or decoded == str then
+            break
+        end
+        str = decoded
         iterations = iterations + 1
     end
 
@@ -1745,7 +1754,15 @@ local function _has_bypass_signals_raw(headers, args, method, uri)
             -- 精确匹配参数键名
             local key = eq and part:sub(1, eq - 1) or part
             if BYPASS_KEYS[key] then
-                return true
+                -- v/t/cb 仅在值为长随机串/时间戳时才视为绕过信号，避免误伤正常版本号/参数
+                if key == "v" or key == "t" or key == "cb" then
+                    local v = eq and part:sub(eq + 1) or ""
+                    if #v > 8 and v:match("^%d+$") then
+                        return true
+                    end
+                else
+                    return true
+                end
             end
 
             -- value熵值检测
@@ -2203,6 +2220,34 @@ end
 return {cluster, uri_count, ip_count}
 ]]
 
+--  优先 EVALSHA 执行（预加载 SHA 避免重复发送脚本），NOSCRIPT 时自动回退 EVAL
+local function safe_eval(red, script_tag, script, numkeys, ...)
+    --  捕获不定参数为表：内层 pcall 闭包会创建新的函数作用域，
+    --    直接写 ... 将引用内层函数的空 varargs，而非外层的真实参数
+    local eval_args = {...}
+    local sha = sha_cache[script_tag]
+    if sha then
+        local ok, res, err = pcall(function()
+            return red:evalsha(sha, numkeys, unpack(eval_args))
+        end)
+        if ok and res ~= nil then
+            return true, res, nil
+        end
+        -- NOSCRIPT：Redis 重启/清理导致脚本丢失，清除缓存以便下次回退 EVAL
+        if err and (err:find("NOSCRIPT", 1, true) or err:find("noscript", 1, true)) then
+            sha_cache[script_tag] = nil
+            ngx.log(ngx.WARN, "[WAF] EVALSHA NOSCRIPT (", script_tag,
+                "), falling back to EVAL, err=", tostring(err))
+        else
+            return ok, res, err
+        end
+    end
+    -- 回退 EVAL：无缓存 SHA 或 NOSCRIPT 后重新加载
+    return pcall(function()
+        return red:eval(script, numkeys, unpack(eval_args))
+    end)
+end
+
 local function detect_cluster(red, ip, uri)
     if not red then
         return 0, 0, 0
@@ -2210,10 +2255,8 @@ local function detect_cluster(red, ip, uri)
 
     local now_ts = ngx.now()
     
-    --  使用 Redis Lua 脚本替代 pipeline，减少网络往返并保证原子性
-    local res, err = red:eval(
-        CLUSTER_DETECT_SCRIPT,
-        2,  -- 2个KEYS
+    --  优先 EVALSHA 执行集群检测脚本，减少网络传输
+    local ok, res, err = safe_eval(red, "cluster", CLUSTER_DETECT_SCRIPT, 2,
         "wf:cluster:ip:" .. ip,
         "wf:cluster:uri:" .. uri,
         now_ts,
@@ -2222,6 +2265,12 @@ local function detect_cluster(red, ip, uri)
         uri,
         ip
     )
+    
+    if not ok then
+        log("error", "CLUSTER_SCRIPT_EXCEPTION", ip, uri,
+            string.format("error=%s", tostring(res)))
+        return 0, 0, 0
+    end
     
     if not res then
         log("error", "CLUSTER_SCRIPT_FAILED", ip, uri, 
@@ -2350,10 +2399,11 @@ local function maybe_escalate_global_modes()
     local current = get_mode()
     -- 熔断模式(mode=3) -> 攻击模式(mode=2) -> 防御模式(mode=1) -> 正常模式(mode=0)
     if current == 3 then
-        if miss_n < cfg.global_origin_miss_threshold
-           and bypass_n < cfg.global_origin_bypass_threshold
-           and entropy_n < cfg.global_origin_entropy_threshold then
-            -- 所有指标都低于熔断阈值，降级到攻击模式
+        --  滞后区间：退出阈值 = 进入阈值 × 70%，避免边界指标震荡导致模式反复切换
+        local hysteresis = 0.7
+        if miss_n < math.floor(cfg.global_origin_miss_threshold * hysteresis)
+           and bypass_n < math.floor(cfg.global_origin_bypass_threshold * hysteresis)
+           and entropy_n < math.floor(cfg.global_origin_entropy_threshold * hysteresis) then
             set_mode(2, cfg.attack_mode_ttl, "auto degrade: origin->attack")
             return
         end
@@ -3275,7 +3325,7 @@ local function evaluate_access(red, ip, uri, method, flags)
     local daily_key  = "wf:daily:" .. day
     local top_ip_key = "wf:top:ip"
 
-    local res, err = red:eval(ACCESS_SCRIPT, 8,
+    local ok, res, err = safe_eval(red, "access", ACCESS_SCRIPT, 8,
         risk_key, rep_key, ban_key, burst_key, slow_key, seen_key, daily_key, top_ip_key,
         flags.risk_add,
         flags.rep_penalty,
@@ -3305,6 +3355,11 @@ local function evaluate_access(red, ip, uri, method, flags)
         cfg.risk_decay_ratio
     )
 
+    if not ok then
+        log("error", "ACCESS_EVAL_EXCEPTION", ip, uri, tostring(res))
+        return nil, "exception: " .. tostring(res)
+    end
+
     if not res then
         log("error", "ACCESS_EVAL_FAILED", ip, uri, err or "unknown")
         return nil, err
@@ -3325,7 +3380,7 @@ local function evaluate_feedback(red, ip, uri, is_miss, is_bypass)
     local top_uri_key = "wf:top:uri"
     local top_ip_key  = "wf:top:ip"
 
-    local res, err = red:eval(FEEDBACK_SCRIPT, 8,
+    local ok, res, err = safe_eval(red, "feedback", FEEDBACK_SCRIPT, 8,
         risk_key, rep_key, ban_key, miss_key, bypass_key, daily_key, top_uri_key, top_ip_key,
         cfg.miss_window_limit,
         cfg.bypass_window_limit,
@@ -3342,6 +3397,11 @@ local function evaluate_feedback(red, ip, uri, is_miss, is_bypass)
         is_miss and 1 or 0,
         is_bypass and 1 or 0
     )
+
+    if not ok then
+        log("error", "FEEDBACK_EVAL_EXCEPTION", ip, uri, tostring(res))
+        return nil, "exception: " .. tostring(res)
+    end
 
     if not res then
         log("error", "FEEDBACK_EVAL_FAILED", ip, uri, err or "unknown")
@@ -3382,6 +3442,28 @@ function _M.init_worker()
     whitelist_last_refresh = init_ts
     ngx.log(ngx.DEBUG, string.format("[WAF] 白名单初始刷新时间: %d", math.floor(init_ts)))
 end
+
+    --  EVALSHA 预加载：启动时向 Redis 注册三个 Lua 脚本，后续用 SHA 调用避免重复传输(~5.5KB)
+    local red = redis_connect()
+    if red then
+        local preload_ok, preload_err = pcall(function()
+            sha_cache["access"]   = red:script("LOAD", ACCESS_SCRIPT)
+            sha_cache["feedback"] = red:script("LOAD", FEEDBACK_SCRIPT)
+            sha_cache["cluster"]  = red:script("LOAD", CLUSTER_DETECT_SCRIPT)
+        end)
+        if preload_ok then
+            ngx.log(ngx.INFO, string.format(
+                "[WAF] EVALSHA预加载完成: access=%s feedback=%s cluster=%s",
+                sha_cache["access"] or "nil",
+                sha_cache["feedback"] or "nil",
+                sha_cache["cluster"] or "nil"))
+        else
+            ngx.log(ngx.WARN, "[WAF] EVALSHA预加载失败，将使用EVAL回退, err=", tostring(preload_err))
+        end
+        redis_close(red)
+    else
+        ngx.log(ngx.WARN, "[WAF] Redis不可用，跳过EVALSHA预加载，将使用EVAL回退")
+    end
 end
 
 -- =========================================================
@@ -3691,8 +3773,15 @@ function _M.access()
     end
 
     -- 【2.8】缓存绕过立即拦截（非静态资源的nocache信号直接拦截）
+    --  首次访问豁免：无Cookie且无Referer的请求不立即拦截，降级到阶段3渐进式处理
+    --    避免新用户首次访问（地址栏回车/F5刷新/书签进入）被误拦
     if cfg.bypass_block_immediately and bypass_signal and not is_static_asset(uri) then
-        return block_request("BYPASS_IMMEDIATE_BLOCKED", ip, uri, "缓存绕过信号")
+        local has_cookie = http_cookie ~= nil and http_cookie ~= ""
+        local has_referer = (referer or "") ~= ""
+        if has_cookie or has_referer then
+            return block_request("BYPASS_IMMEDIATE_BLOCKED", ip, uri, "缓存绕过信号")
+        end
+        -- 首次访问无Cookie无Referer → 不立即拦截，由阶段3.1渐进式处理
     end
 
     -- 定期清理Redis数据，防止内存泄漏
@@ -3715,8 +3804,11 @@ function _M.access()
             return ngx.exit(429)
         end
 
-        -- 阶段式策略：强制缓存→警告
-        if bypass_count >= 4 and bypass_count < 9 then
+        -- 阶段式策略：首次容忍 → 强制缓存 → 警告 → 拦截
+        if bypass_count == 1 then
+            -- 首次绕过信号仅记录，不惩罚：避免用户 F5 刷新 / 初次访问被误伤
+            dlog(string.format("首次绕过信号，观察中: ip=%s count=%d", ip, bypass_count))
+        elseif bypass_count >= 4 and bypass_count < 9 then
             dlog(string.format("回源阶段1: 强制缓存 count=%d (将在放行时设置)", bypass_count))
         elseif bypass_count >= 9 and bypass_count < 16 then
             log("warn", "BYPASS_STAGE_2_WARNING", ip, uri,
@@ -4257,7 +4349,16 @@ function _M.log()
     if not is_miss and not is_bypass then
         return
     end
-    local ok, err = ngx.timer.at(0, function(premature, ip, uri, is_miss, is_bypass, status, req_id)
+
+    --  提前捕获 UA：timer 回调中 request context 可能已清理，
+    --    ngx.req.get_headers() 会返回空 table 或抛 "no request context" 错误
+    local ua_for_timer = ""
+    local ok_h, headers_pre = pcall(ngx.req.get_headers, 50)
+    if ok_h and headers_pre then
+        ua_for_timer = headers_pre["user-agent"] or ""
+    end
+
+    local ok, err = ngx.timer.at(0, function(premature, ip, uri, is_miss, is_bypass, status, req_id, ua_timer)
         if premature then
             return
         end
@@ -4282,9 +4383,8 @@ function _M.log()
         local miss_n = tonumber(res[4]) or 0
         local bypass_n = tonumber(res[5]) or 0
 
-        -- 检查是否是伪装的探测bot
-        local headers_log = ngx.req.get_headers(50)
-        local ua = headers_log["user-agent"] or ""
+        -- 检查是否是伪装的探测bot（UA 由 log() 阶段提前捕获传入，避免 timer 中 request context 已失效）
+        local ua = ua_timer or ""
         local is_suspicious_bot = false
 
         -- 可疑bot特征：UA声称是bot但行为异常
@@ -4334,7 +4434,7 @@ function _M.log()
         end
 
         redis_close(red)
-    end, ip, uri, is_miss, is_bypass, status, ngx.ctx.wf_req_id)
+    end, ip, uri, is_miss, is_bypass, status, ngx.ctx.wf_req_id, ua_for_timer)
 
     if not ok then
         ngx.log(ngx.ERR, string.format("[WAF] Failed to create timer: %s", err or "unknown"))
@@ -4404,14 +4504,6 @@ end
 
 -- =========================================================
 -- 自动执行对应阶段（兼容 init_worker_by_lua_file 加载方式）
--- =========================================================
--- 支持两种加载方式：
---    Nginx 会在每个阶段重新加载脚本，根据 phase 自动执行
---
---    Lua 缓存模块，只加载一次，需要手动调用 _M.access() 等
---
--- - 方式1：脚本会被多次加载，每次执行对应阶段的函数
--- - 方式2：模块只加载一次，返回 _M 对象供后续调用
 -- =========================================================
 -- =========================================================
 
