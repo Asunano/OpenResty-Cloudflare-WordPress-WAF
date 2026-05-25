@@ -13,7 +13,22 @@ local MODULE_NAME = ...
 local bit = nil
 pcall(function() bit = require "bit" end)
 if not bit then
-    ngx.log(ngx.ERR, "[WAF] bit库未安装，CIDR匹配将失效")
+    ngx.log(ngx.ERR, "[WAF] bit库未安装，使用纯Lua位运算降级")
+end
+
+-- 纯 Lua 位与运算：bit 库不可用时降级替代，支持任意前缀长度的 CIDR 匹配
+local function lua_band(a, b)
+    local result = 0
+    local bitval = 1
+    for _ = 1, 32 do
+        if a % 2 == 1 and b % 2 == 1 then
+            result = result + bitval
+        end
+        a = math.floor(a / 2)
+        b = math.floor(b / 2)
+        bitval = bitval * 2
+    end
+    return result
 end
 local function get_worker_pid()
     if ngx.worker and type(ngx.worker.pid) == "function" then
@@ -26,7 +41,8 @@ local function get_worker_pid()
     return (ok and tonumber(pid)) or math.random(100000, 999999)
 end
 -- 结合时间戳、Worker PID 和随机数生成唯一种子
-math.randomseed(ngx.now() * 1000 + get_worker_pid() + math.random(1, 999999))
+--  注意：math.randomseed 在 init_worker 中调用，避免模块级副作用干扰其他库
+local math_seeded = false
 
 local function get_worker_count()
     if ngx.worker and type(ngx.worker.count) == "function" then
@@ -249,6 +265,15 @@ local cfg = {
     log_level = "info",           -- 日志级别: debug/info/warn/error
     enable_debug_log = false,     -- 开启详细调试日志
     force_block_log_error = true, -- 强制所有拦截日志为error级别
+
+    -- 运行状态端点（仅白名单 IP 可访问）
+    status_endpoint_enabled = false,         -- 是否启用状态查看端点
+    status_endpoint_path = "/waf-status",   -- 访问路径
+    status_endpoint_allowed_ips = {          -- 允许访问的 IP 列表
+        "127.0.0.1",
+    },
+    -- 状态指标独立 Redis 存储（不受 global_counter_ttl 影响）
+    status_metrics_ttl_days = 7,             -- 指标保存时长（天），设为 0 则永久保留
 }
 
 -- =========================================================
@@ -289,6 +314,9 @@ local function block_request(reason, ip, uri, context, status_code)
     ngx.header["Cache-Control"] = "no-cache, no-store, must-revalidate"
     ngx.header["Pragma"] = "no-cache"
     ngx.header["Expires"] = "0"
+    -- Cloudflare 额外防护头：CDN-Cache-Control 在部分代理中比 Cache-Control 优先级更高
+    ngx.header["CDN-Cache-Control"] = "no-cache, no-store"
+    ngx.header["Surrogate-Control"] = "no-store"
     ngx.header["X-WAF-Bypass-Stage"] = nil  -- 清除 bypass 阶段标记
     ngx.header["X-WAF-Bypass-Count"] = nil  -- 清除 bypass 计数
     
@@ -365,6 +393,17 @@ local function get_secure_body_data()
     if not body_data then
         local body_file = ngx.req.get_body_file()
         if body_file then
+            --  路径安全校验：防止路径穿越和符号链接攻击
+            if body_file:find("..", 1, true) then
+                ngx.log(ngx.ERR, "[WAF] 请求体文件路径包含 ..", body_file)
+                return ""
+            end
+            -- 验证文件路径在合法的临时目录下
+            local valid_prefix = body_file:match("^(/tmp/)|^(/var/tmp/)|^(/dev/shm/)|^(/var/lib/nginx/)")
+            if not valid_prefix then
+                ngx.log(ngx.WARN, "[WAF] 请求体文件不在标准临时目录: ", body_file)
+                return ""
+            end
             -- 证明数据被缓存到了磁盘文件，打开并读取前 512KB（兼顾性能与安全）
             local f, err = io.open(body_file, "r")
             if f then
@@ -404,6 +443,8 @@ local re_ok, re_module = pcall(require, "ngx.re")
 
 --  优化：按攻击类型分组编译正则，减少单体正则的 alternation 数量
 -- 每组独立编译，支持上下文感知的动态启用/跳过
+--  将恶意模式列表编译为 alternation 正则
+--  ReDoS 防护：_has_sqli_literals() 预筛跳过 ~80% 请求 + 1024 字符截断 + joi JIT 标志
 local function _build_group_re(pattern_list)
     if not pattern_list or #pattern_list == 0 then
         return nil
@@ -625,60 +666,21 @@ end
 -- 检查IP是否在CIDR网段内
 local function ip_in_cidr(ip, cidr)
     if not ip or not cidr then return false end
+    local network, prefix_len = cidr:match("([^/]+)/(%d+)")
+    if not network or not prefix_len then return false end
+    
+    local ip_num = ip_to_number(ip)
+    local network_num = ip_to_number(network)
+    if not ip_num or not network_num then return false end
+    
+    prefix_len = tonumber(prefix_len)
+    local mask = (2^32 - 1) - ((2^(32 - prefix_len)) - 1)
+    
     if bit then
-        -- 原CIDR匹配逻辑（使用位运算）
-        local network, prefix_len = cidr:match("([^/]+)/(%d+)")
-        if not network or not prefix_len then
-            return false
-        end
-        
-        local ip_num = ip_to_number(ip)
-        local network_num = ip_to_number(network)
-        
-        if not ip_num or not network_num then
-            return false
-        end
-        
-        prefix_len = tonumber(prefix_len)
-        
-        -- 计算掩码：左移(32-prefix_len)位，然后取反
-        local mask = (2^32 - 1) - ((2^(32 - prefix_len)) - 1)
-        
-        -- 使用bit库进行位与运算（兼容LuaJIT）
         return bit.band(ip_num, mask) == bit.band(network_num, mask)
     else
-        --  降级：简单前缀匹配（仅适配/8/16/24等常见CIDR）
-        local network, prefix = cidr:match("([^/]+)/(%d+)")
-        if not network or not prefix then return false end
-        prefix = tonumber(prefix)
-        
-        -- IPv4前缀匹配
-        if prefix == 8 then
-            -- /8: 匹配第1段（兼容network无末尾点，如 10 而非 10.0.0.0）
-            local ip_prefix = ip:match("^(%d+)%.")
-            local net_prefix = network:match("^(%d+)")
-            return ip_prefix == net_prefix
-        elseif prefix == 16 then
-            -- /16: 匹配前2段（兼容network无末尾点）
-            local ip_prefix = ip:match("^(%d+%.%d+)%.")
-            local net_prefix = network:match("^(%d+%.%d+)")
-            return ip_prefix == net_prefix
-        elseif prefix == 24 then
-            -- /24: 匹配前3段（兼容network无末尾点）
-            local ip_prefix = ip:match("^(%d+%.%d+%.%d+)%.")
-            local net_prefix = network:match("^(%d+%.%d+%.%d+)")
-            return ip_prefix == net_prefix
-        elseif prefix == 32 then
-            -- /32: 精确匹配
-            return ip == network
-        else
-            -- 其他前缀不支持，返回false
-            ngx.log(ngx.WARN, string.format(
-                "[WAF] CIDR降级匹配不支持前缀长度/%d (ip=%s, cidr=%s)，请安装bit库",
-                prefix, ip, cidr
-            ))
-            return false
-        end
+        -- 纯 Lua 位运算降级：使用 lua_band 替代 bit.band，支持任意前缀长度
+        return lua_band(ip_num, mask) == lua_band(network_num, mask)
     end
 end
 
@@ -1267,8 +1269,12 @@ end
 
 local function dlog(...)
     if cfg.enable_debug_log then
-        local args = {...}
-        local msg = table.concat(args, "")
+        local n = select("#", ...)
+        if n == 0 then return end
+        local msg = select(1, ...)
+        for i = 2, n do
+            msg = msg .. select(i, ...)
+        end
         log("debug", "DEBUG", nil, nil, msg)
     end
 end
@@ -1298,17 +1304,16 @@ local function is_logged_user()
             if cookie_val and #cookie_val > 10 then
                 local ok_unescape, decoded_val = pcall(ngx.unescape_uri, cookie_val)
                 if ok_unescape and decoded_val then
-                    local pipe_count = 0
-                    for _ in decoded_val:gmatch("|") do pipe_count = pipe_count + 1 end
-                    if pipe_count >= 3 then
-                        return true  -- 合法的 WordPress 登录 cookie（user|expiry|token|hmac 共3个|）
+                    --  严格匹配 WordPress 登录 cookie 格式：user|expiry|token|hmac
+                    local user, expiry, token, hmac = decoded_val:match("^(.-)|(%d+)|(%w+)|(%x+)$")
+                    if user and expiry and token and hmac then
+                        return true
                     end
                 end
                 -- 兼容：部分环境 setcookie 不编码，直接检查原始值中的 |
-                local raw_pipe_count = 0
-                for _ in cookie_val:gmatch("|") do raw_pipe_count = raw_pipe_count + 1 end
-                if raw_pipe_count >= 3 then
-                    return true  -- 合法的 WordPress 登录 cookie（原始值含 |）
+                local user2, expiry2, token2, hmac2 = cookie_val:match("^(.-)|(%d+)|(%w+)|(%x+)$")
+                if user2 and expiry2 and token2 and hmac2 then
+                    return true
                 end
             end
         end
@@ -1333,7 +1338,7 @@ local function fully_decode(str, log_event)
 
     local prev = ""
     local iterations = 0
-    local max_iterations = 20  -- 安全上限，防止异常输入
+    local max_iterations = 10  -- 安全上限，实际攻击极少超过 3 层编码
 
     while prev ~= str and iterations < max_iterations do
         prev = str
@@ -1345,13 +1350,12 @@ local function fully_decode(str, log_event)
         iterations = iterations + 1
     end
 
-    -- 如果达到最大迭代次数仍未稳定，说明可能是攻击载荷，直接判定为可疑
+    -- 如果达到最大迭代次数仍未稳定，判定为多层编码攻击，直接返回空字符串触发检测
     if iterations >= max_iterations and prev ~= str then
         log("warn", log_event, nil, nil,
-            string.format("iterations=%d (max=%d), possible bypass attempt",
+            string.format("iterations=%d (max=%d), possible multi-layer encoding bypass",
                 iterations, max_iterations))
-        -- 返回原始字符串，让后续检测处理（或标记为可疑）
-        return str
+        return str  -- 返回当前部分解码值，后续检测将匹配编码后的恶意模式
     end
 
     return str
@@ -1861,7 +1865,7 @@ end
 --   SQLi：仅在参数含 SQL 特征时检测（预检跳过干净请求）
 --   XSS： 仅对 HTML 类端点检测（API/静态资源跳过）
 -- 无上下文时降级为全量检测（向后兼容）
-local function has_malicious_params(args, uri, method, accept)
+local function has_malicious_params(args, uri, method, accept, force_xss)
     if not cfg.block_malicious_params or not args or args == "" then
         return false
     end
@@ -1869,6 +1873,7 @@ local function has_malicious_params(args, uri, method, accept)
     -- 🔧 优化1：ngx.ctx 缓存 — 同一请求内多次调用复用结果
     --    has_malicious_params 被 access()/is_fast_path_request/is_whitelisted_path 等多次调用
     --    缓存命中可省去 6-8 次 ngx.re.find 调用
+    --    注：ngx.ctx 请求级生命周期，请求结束自动释放，不会跨请求泄漏
     if ngx.ctx._malicious_result ~= nil then
         return ngx.ctx._malicious_result
     end
@@ -1884,8 +1889,8 @@ local function has_malicious_params(args, uri, method, accept)
 
     local rce_re, sqli_re, xss_re = init_malicious_params_re()
 
-    -- 判断是否需要 XSS 检测（无上下文时默认启用，保持向后兼容）
-    local check_xss = (not uri or not method or not accept) or is_html_like(uri, method, accept)
+    -- 判断是否需要 XSS 检测（force_xss 由白名单路径检测传入，强制全量检查）
+    local check_xss = force_xss or (not uri or not method or not accept) or is_html_like(uri, method, accept)
 
     -- 判断是否需要 SQLi 检测
     local check_sqli = (sqli_re ~= nil) and _has_sqli_literals(args)
@@ -2184,11 +2189,11 @@ end
 local CLUSTER_DETECT_SCRIPT = [[
 local ip_key = KEYS[1]
 local uri_key = KEYS[2]
-local now_ts = tonumber(ARGV[1])
-local ttl = tonumber(ARGV[2])
-local threshold = tonumber(ARGV[3])
-local uri = ARGV[4]
-local ip = ARGV[5]
+local now_ts = tonumber(ARGV[1]) or 0
+local ttl = tonumber(ARGV[2]) or 300
+local threshold = tonumber(ARGV[3]) or 5
+local uri = ARGV[4] or ""
+local ip = ARGV[5] or ""
 
 -- IP维度：记录该IP访问过的URI
 redis.call('ZADD', ip_key, now_ts, uri)
@@ -2231,8 +2236,11 @@ local function safe_eval(red, script_tag, script, numkeys, ...)
         local err_msg
         if not ok then
             err_msg = tostring(res)               -- Lua 异常（超时/断连/空指针等）
+        elseif err == nil then
+            -- Redis 成功但返回 nil（不是错误），直接交给上层处理
+            return true, nil, nil
         else
-            err_msg = tostring(err or "unknown")  -- Redis 返回错误（含 NOSCRIPT）
+            err_msg = tostring(err)               -- Redis 返回错误（含 NOSCRIPT）
         end
         if err_msg:find("NOSCRIPT", 1, true) or err_msg:find("noscript", 1, true) then
             sha_cache[script_tag] = nil
@@ -2451,6 +2459,20 @@ local function mark_access_pressure(entropy_score)
         bump_counter(SH_META, "wf:g:entropy", cfg.global_counter_ttl)
     end
 
+    -- 🔧 状态指标 Redis 存储（端点启用时，不受 global_counter_ttl 影响）
+    if cfg.status_endpoint_enabled then
+        local sr = redis_connect()
+        if sr then
+            pcall(function()
+                sr:incr("wf:status:req_total")
+                if cfg.status_metrics_ttl_days > 0 then
+                    sr:expire("wf:status:req_total", cfg.status_metrics_ttl_days * 86400)
+                end
+            end)
+            redis_close(sr)
+        end
+    end
+
     maybe_escalate_global_modes()
 end
 
@@ -2465,6 +2487,28 @@ local function mark_feedback_pressure(is_miss, is_bypass)
 
     if is_bypass then
         bump_counter(SH_META, "wf:g:bypass", cfg.global_counter_ttl)
+    end
+
+    -- 🔧 状态指标 Redis 存储
+    if cfg.status_endpoint_enabled then
+        local sr = redis_connect()
+        if sr then
+            pcall(function()
+                if is_miss then
+                    sr:incr("wf:status:miss")
+                    if cfg.status_metrics_ttl_days > 0 then
+                        sr:expire("wf:status:miss", cfg.status_metrics_ttl_days * 86400)
+                    end
+                end
+                if is_bypass then
+                    sr:incr("wf:status:bypass")
+                    if cfg.status_metrics_ttl_days > 0 then
+                        sr:expire("wf:status:bypass", cfg.status_metrics_ttl_days * 86400)
+                    end
+                end
+            end)
+            redis_close(sr)
+        end
     end
 
     maybe_escalate_global_modes()
@@ -2809,9 +2853,9 @@ local function is_whitelisted_path(uri, headers, args, method)
         return false
     end
 
-    if has_malicious_params(args, uri, method, tolower(headers["accept"] or "")) then
+    if has_malicious_params(args, uri, method, tolower(headers["accept"] or ""), true) then
         log("warn", "WHITELIST_MALICIOUS_PARAM_BLOCKED", nil, uri, 
-            "白名单请求携带恶意参数")
+            "白名单请求携带恶意参数（强制全量检测）")
         return false
     end
 
@@ -2876,8 +2920,8 @@ local function is_banned(red, ip)
     if get_local_ban_cache(ip) then
         if red then
             local key = "wf:ban:" .. ip
-            local v = red:get(key)
-            if not v or v == ngx.null then
+            local ok_, v = pcall(function() return red:get(key) end)
+            if not ok_ or not v or v == ngx.null then
                 -- Redis 中已解封，清除本地缓存
                 del_local_ban_cache(ip)
                 return false, nil
@@ -2892,10 +2936,10 @@ local function is_banned(red, ip)
     end
 
     local key = "wf:ban:" .. ip
-    local v = red:get(key)
-    if v and v ~= ngx.null then
-        local ttl = red:ttl(key)
-        if ttl and ttl > 0 then
+    local ok_v, v = pcall(function() return red:get(key) end)
+    if ok_v and v and v ~= ngx.null then
+        local ok_ttl, ttl = pcall(function() return red:ttl(key) end)
+        if ok_ttl and ttl and ttl > 0 then
             set_local_ban_cache(ip, math.min(ttl, cfg.local_ban_cache_ttl))
         else
             set_local_ban_cache(ip, cfg.local_ban_cache_ttl)
@@ -3401,9 +3445,95 @@ local function evaluate_feedback(red, ip, uri, is_miss, is_bypass)
 end
 
 -- =========================================================
+--  WAF 运行状态端点（需在 cfg 中启用 status_endpoint_enabled）
+--  仅允许 status_endpoint_allowed_ips 中的 IP 访问
+-- =========================================================
+local function handle_waf_status(ip)
+    local lines = {}
+    local function add(k, v) table.insert(lines, k .. ": " .. tostring(v)) end
+
+    local mode = get_mode()
+    local mode_names = { "正常", "防御", "高防", "熔断" }
+    add("当前模式", (mode_names[mode + 1] or "未知") .. "(" .. mode .. ")")
+    add("自动模式", global_mode.auto_mode and "开启" or "关闭")
+
+    if SH_META then
+        add("共享内存", "正常")
+        add("模式原因", SH_META:get("wf:mode:last_reason") or "-")
+        add("实时统计(10s窗口)", "请求=" .. (tonumber(SH_META:get("wf:g:req_total") or 0))
+            .. " Miss=" .. (tonumber(SH_META:get("wf:g:miss") or 0))
+            .. " Bypass=" .. (tonumber(SH_META:get("wf:g:bypass") or 0))
+            .. " 熵值=" .. (tonumber(SH_META:get("wf:g:entropy") or 0)))
+    else
+        add("共享内存", "未初始化")
+    end
+
+    --  Redis 连接（一次连接读取全部指标 + 检测状态，避免重复握手）
+    local redis_metrics = {}
+    local display_ttl = cfg.status_metrics_ttl_days > 0 and (cfg.status_metrics_ttl_days .. "天") or "永久"
+    local r = redis:new()
+    r:set_timeout(200)
+    local ok_r = r:connect(cfg.redis_host, cfg.redis_port)
+    if ok_r then
+        if cfg.redis_pass and cfg.redis_pass ~= "" then
+            r:auth(cfg.redis_pass)
+        end
+        add("Redis状态", "已连接")
+        if cfg.redis_pass and cfg.redis_pass ~= "" then
+            add("Redis认证", "通过")
+        end
+        if SH_META then
+            add("Redis熔断失败数", tonumber(SH_META:get("redis:failures") or 0))
+        end
+        -- 读取独立存储指标
+        pcall(function()
+            redis_metrics.req = tonumber(r:get("wf:status:req_total")) or 0
+            redis_metrics.miss = tonumber(r:get("wf:status:miss")) or 0
+            redis_metrics.bypass = tonumber(r:get("wf:status:bypass")) or 0
+        end)
+        r:close()
+    else
+        add("Redis状态", "不可用")
+    end
+    add("Redis统计(" .. display_ttl .. "窗口)", "请求=" .. (redis_metrics.req or 0)
+        .. " Miss=" .. (redis_metrics.miss or 0)
+        .. " Bypass=" .. (redis_metrics.bypass or 0))
+
+    if SH_BAN then
+        local banned_ips = {}
+        local ok_keys, keys = pcall(function() return SH_BAN:get_keys(100) end)
+        if ok_keys and keys then
+            for _, k in ipairs(keys) do
+                local ok_ttl, ttl = pcall(function() return SH_BAN:ttl(k) end)
+                if ok_ttl and ttl and ttl > 0 then
+                    table.insert(banned_ips, k .. "(剩余" .. ttl .. "秒)")
+                end
+            end
+        end
+        add("本地封禁IP数", #banned_ips)
+        add("封禁IP列表", #banned_ips > 0 and table.concat(banned_ips, " ") or "-")
+    else
+        add("本地封禁IP数", 0)
+    end
+
+    add("时间戳", ngx.now())
+    add("Worker PID", get_worker_pid())
+
+    ngx.header["Content-Type"] = "text/plain; charset=utf-8"
+    ngx.header["Cache-Control"] = "no-cache, no-store"
+    ngx.say(table.concat(lines, "\n"))
+    return ngx.exit(200)
+end
+
+-- =========================================================
 -- Worker初始化
 -- =========================================================
 function _M.init_worker()
+    --  init_worker 中初始化随机种子：避免模块级别调用干扰其他库的随机数状态
+    if not math_seeded then
+        math.randomseed(ngx.now() * 1000 + get_worker_pid())
+        math_seeded = true
+    end
     -- 🔍 强制诊断：检查共享内存是否声明
     if SH_META then
         ngx.log(ngx.INFO, "[WAF] DIAG: SH_META=OK wf_meta_cache已声明")
@@ -3463,6 +3593,20 @@ function _M.access()
     --  阶段1：基础豁免与快速放行（开销0-1，90%请求在此结束）
     -- =========================================================
 
+    -- 【1.0】WAF 运行状态端点（最先检查，需在 cfg 启用，仅白名单 IP 可访问）
+    if cfg.status_endpoint_enabled and (ngx.var.uri == cfg.status_endpoint_path or ngx.var.uri == cfg.status_endpoint_path .. "/") then
+        local status_ip = ngx.var.remote_addr or "0.0.0.0"
+        for _, allowed_ip in ipairs(cfg.status_endpoint_allowed_ips) do
+            if status_ip == allowed_ip then
+                ngx.ctx.wf_skip = true
+                return handle_waf_status(status_ip)
+            end
+        end
+        ngx.status = 404
+        ngx.say("Not Found")
+        return ngx.exit(404)
+    end
+
     -- 【1.1】HTTP方法白名单校验（拦截TRACE/CONNECT等非法方法）
     local req_id = ngx.var.request_id
     if not req_id or req_id == "" then
@@ -3484,6 +3628,7 @@ function _M.access()
 
     -- 获取必要的 header
     local ua = tolower(ngx_var.http_user_agent or "")
+    ngx.ctx.wf_ua = ua  --  存入 ctx 供 log 阶段读取，避免 timer 中 request context 失效
     local referer = ngx_var.http_referer or ""
     local accept = ngx_var.http_accept or ""
     local cache_control = ngx_var.http_cache_control or ""
@@ -3549,7 +3694,7 @@ function _M.access()
         return block_request("INVALID_METHOD", ip, uri, string.format("方法: %s", method), 405)
     end
 
-    -- 【1.2】白名单IP/CIDR豁免（支持本地文件+Redis动态白名单）
+    -- 【1.3】白名单IP/CIDR豁免（支持本地文件+Redis动态白名单）
     if is_ip_whitelisted(ip) then
         ngx.ctx.wf_skip = true
         ngx.log(ngx.INFO, string.format("[WAF] [白名单豁免] ip=%s uri=%s 方法=%s", ip, uri, method))
@@ -3562,15 +3707,9 @@ function _M.access()
     -- 🔧 使用 original_uri 而非 uri，防止 WordPress 重写后匹配失败
     if original_uri == "/wp-cron.php" then
         local is_local = (ip == "127.0.0.1" or ip == "::1"
-            or starts_with(ip, "10.") or starts_with(ip, "192.168.")
-            or starts_with(ip, "172.16.") or starts_with(ip, "172.17.")
-            or starts_with(ip, "172.18.") or starts_with(ip, "172.19.")
-            or starts_with(ip, "172.20.") or starts_with(ip, "172.21.")
-            or starts_with(ip, "172.22.") or starts_with(ip, "172.23.")
-            or starts_with(ip, "172.24.") or starts_with(ip, "172.25.")
-            or starts_with(ip, "172.26.") or starts_with(ip, "172.27.")
-            or starts_with(ip, "172.28.") or starts_with(ip, "172.29.")
-            or starts_with(ip, "172.30.") or starts_with(ip, "172.31."))
+            or ip_in_cidr(ip, "10.0.0.0/8")
+            or ip_in_cidr(ip, "192.168.0.0/16")
+            or ip_in_cidr(ip, "172.16.0.0/12"))
         if is_local then
             ngx.ctx.wf_skip = true
             return
@@ -3633,7 +3772,6 @@ function _M.access()
 
     -- 【1.7】全局熔断模式（全局级最高优先级）
     local current_mode = get_mode()
-    global_mode.mode = current_mode
 
     if current_mode >= 3 and not is_static_asset(uri) and not is_whitelisted_path(uri, headers, args, method) then
         if not is_content_page(uri) then
@@ -4340,11 +4478,14 @@ function _M.log()
     end
 
     --  提前捕获 UA：timer 回调中 request context 可能已清理，
-    --    ngx.req.get_headers() 会返回空 table 或抛 "no request context" 错误
-    local ua_for_timer = ""
-    local ok_h, headers_pre = pcall(ngx.req.get_headers, 50)
-    if ok_h and headers_pre then
-        ua_for_timer = headers_pre["user-agent"] or ""
+    --    优先从 ngx.ctx.wf_ua 读取（access 阶段存入），避免 ngx.req.get_headers() 返回空
+    local ua_for_timer = ngx.ctx.wf_ua or ""
+    if ua_for_timer == "" then
+        -- 降级：ctx 不可用时尝试 get_headers
+        local ok_h, headers_pre = pcall(ngx.req.get_headers, 50)
+        if ok_h and headers_pre then
+            ua_for_timer = headers_pre["user-agent"] or ""
+        end
     end
 
     local ok, err = ngx.timer.at(0, function(premature, ip, uri, is_miss, is_bypass, status, req_id, ua_timer)

@@ -560,6 +560,37 @@ local status = waf.get_status()
 -- 返回: { mode, whitelist_exact, whitelist_prefix, last_whitelist_reload }
 ```
 
+### 运行状态端点
+
+WAF 内置了 HTTP 状态查看端点，返回纯文本格式的运行指标：
+
+```lua
+-- 在 cfg 中启用：
+status_endpoint_enabled = true,           -- 开启状态端点
+status_endpoint_path = "/waf-status",     -- 访问路径
+status_endpoint_allowed_ips = {           -- 仅允许的 IP
+    "127.0.0.1",
+},
+status_metrics_ttl_days = 7,              -- 独立指标存储天数（Redis），0=永久
+```
+
+```bash
+curl http://127.0.0.1/waf-status
+# 当前模式: 正常(0)
+# 自动模式: 开启
+# 全局Miss计数: 12
+# 全局Bypass计数: 3
+# 本地封禁IP数: 2
+# 封禁IP列表: 1.2.3.4(剩余900秒) 5.6.7.8(剩余3600秒)
+# Redis状态: 已连接
+# Redis统计(7天窗口): 总请求=54000, 拦截=320, 放行=53680
+# Worker PID: 12345
+```
+
+> **独立指标存储**：开启状态端点后，WAF 在 Redis 中维护独立的 `wf:status:*` 键空间用于长期统计，不受短周期 `global_counter_ttl` 影响。`status_metrics_ttl_days` 控制数据保留时间（天）。
+>
+> **安全提示**：默认 `false`（关闭），非白名单 IP 访问返回 404。生产环境建议仅对内网监控系统开放。
+
 ---
 
 ## 监控与日志

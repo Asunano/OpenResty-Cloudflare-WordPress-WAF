@@ -561,6 +561,37 @@ local status = waf.get_status()
 -- Returns: { mode, whitelist_exact, whitelist_prefix, last_whitelist_reload }
 ```
 
+### WAF Status Endpoint
+
+The WAF has a built-in HTTP status endpoint that returns plain-text runtime metrics:
+
+```lua
+-- Enable in cfg:
+status_endpoint_enabled = true,           -- Enable status endpoint
+status_endpoint_path = "/waf-status",     -- Access path
+status_endpoint_allowed_ips = {           -- Allowed IPs only
+    "127.0.0.1",
+},
+status_metrics_ttl_days = 7,              -- Independent metrics storage TTL in days, 0=permanent
+```
+
+```bash
+curl http://127.0.0.1/waf-status
+# Current Mode: Normal(0)
+# Auto Mode: On
+# Global Miss: 12
+# Global Bypass: 3
+# Local Bans: 2
+# Banned IPs: 1.2.3.4(900s) 5.6.7.8(3600s)
+# Redis Status: Connected
+# Redis Stats(7d window): Total=54000, Blocked=320, Passed=53680
+# Worker PID: 12345
+```
+
+> **Independent metrics storage**: When the status endpoint is enabled, the WAF maintains a separate `wf:status:*` keyspace in Redis for long-term statistics, unaffected by short-cycle `global_counter_ttl`. `status_metrics_ttl_days` controls the data retention period (in days).
+>
+> **Security note**: Defaults to `false` (disabled). Non-whitelisted IPs receive 404. For internal monitoring only.
+
 ---
 
 ## Monitoring & Logging
