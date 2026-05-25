@@ -103,6 +103,9 @@ systemctl restart redis-server
 curl "http://your-domain.com/?id=1' union select 1,2,3--"
 # 应返回 403 Forbidden
 ```
+### 6.配置修改
+
+WAF 配置参考指南 [CONFIG_zh.md](CONFIG_zh.md)
 
 ---
 
