@@ -234,7 +234,7 @@ local cfg = {
     -- 路径穿越/URL污染关键字（仅保留原始形式，检测时会先URL解码）
     path_traversal_signals = {
         "../", "./", "//", "\\",
-        "%00", "%0a", "%0d", "%09", ";",
+        "%00", "%0a", "%0d", "%09",
     },
 
     -- ==============================================
@@ -487,13 +487,18 @@ local function set_mode(level, ttl, reason)
     end
     
     --  TOCTOU 竞态保护：get+check+set 原子化到同一 pcall，竞态窗口缩小到微秒级（SH_META:get() → SH_META:set()）
+    --  关键：SH_META:set() 失败时返回 (false, "no memory") 而非抛异常，需在 pcall 内用 error() 转换为异常
     local old_level = 0
     local ok, err = pcall(function()
         old_level = tonumber(SH_META:get("wf:mode:level")) or 0
         if old_level == level then
             return true  -- 已处于目标模式，跳过写入
         end
-        return SH_META:set("wf:mode:level", level, ttl)
+        local set_ok, set_err = SH_META:set("wf:mode:level", level, ttl)
+        if not set_ok then
+            error("set failed: " .. tostring(set_err))
+        end
+        return true
     end)
     
     if not ok then
@@ -734,8 +739,19 @@ local function acquire_distributed_lock(lock_key, ttl)
                     ))
                     -- 竞态场景：锁在检查过期后、删除前刚好过期，其他 worker 获取了新锁
                     safe_release_distributed_lock(lock_key, old_lock)
-                    -- 重新尝试获取
-                    lock_acquired = SH_META:add(lock_key, lock_val, ttl)
+                    --  过期锁重试（最多 3 次）：极端并发下其他 worker 可能已抢占
+                    for retry = 1, 3 do
+                        lock_acquired = SH_META:add(lock_key, lock_val, ttl)
+                        if lock_acquired then
+                            ngx.log(ngx.WARN, string.format(
+                                "[WAF] 过期锁 %s 重试%d次后成功获取", lock_key, retry))
+                            break
+                        end
+                    end
+                    if not lock_acquired then
+                        ngx.log(ngx.WARN, string.format(
+                            "[WAF] 过期锁 %s 重试3次失败，被其他 worker 抢占", lock_key))
+                    end
                 end
             end
         end
@@ -922,24 +938,22 @@ local function cleanup_redis_data_if_needed()
         ngx.log(ngx.DEBUG, "[WAF] Redis清理被锁定，跳过本次清理")
         return
     end
-    local ok, err = xpcall(function()
+    local ok, err
+    local red, conn_err = redis_connect()
+    if not red then
+        ngx.log(ngx.WARN, "[WAF] Redis 连接失败，跳过清理")
+        safe_release_distributed_lock(lock_key, lock_val)
+        return
+    end
+
+    ok, err = xpcall(function()
         ngx.log(ngx.INFO, "[WAF] 开始定期清理 Redis ZSET 数据...")
-        
-        local red, conn_err = redis_connect()
-        if not red then
-            ngx.log(ngx.WARN, "[WAF] Redis 连接失败，跳过清理")
-            return
-        end
-        local function safe_redis_close(r)
-            if r then
-                pcall(function() redis_close(r) end)
-            end
-        end
+
         local keys_to_clean = {
             "wf:top:ip",
             "wf:top:uri",
         }
-        
+
         local cleaned_count = 0
         for _, key in ipairs(keys_to_clean) do
             local ttl_val = red:ttl(key)
@@ -964,12 +978,12 @@ local function cleanup_redis_data_if_needed()
         -- 7天前的 key 应该已经过期，但可能存在未正确设置 TTL 的遗留数据
         local current_date = os.date("%Y%m%d")
         local seven_days_ago = os.date("%Y%m%d", os.time() - 7*86400)
-        
+
         -- 尝试清理 7-30 天前的 daily_key
         for days_back = 7, 30 do
             local old_date = os.date("%Y%m%d", os.time() - days_back*86400)
             local old_daily_key = "wf:daily:" .. old_date
-            
+
             -- 检查 key 是否存在
             local exists = red:exists(old_daily_key)
             if exists == 1 then
@@ -983,17 +997,19 @@ local function cleanup_redis_data_if_needed()
                 end
             end
         end
-        safe_redis_close(red)
-        
+
         -- 更新最后清理时间
         SH_META:set("redis:cleanup:last_run", now, cleanup_interval * 2)
-        
+
         ngx.log(ngx.INFO, string.format("[WAF] Redis ZSET 清理完成，共清理%d个元素", cleaned_count))
     end, function(err_msg)
         -- 错误处理：记录详细堆栈信息
         ngx.log(ngx.ERR, string.format("[WAF] Redis 清理发生异常: %s\n%s",
             tostring(err_msg), debug.traceback()))
     end)
+
+    --  无论 xpcall 成功或失败，确保释放 Redis 连接（放在 xpcall 外防止异常时泄漏）
+    pcall(function() redis_close(red) end)
     safe_release_distributed_lock(lock_key, lock_val)
 
     if not ok then
@@ -1284,14 +1300,14 @@ local function is_logged_user()
                 if ok_unescape and decoded_val then
                     local pipe_count = 0
                     for _ in decoded_val:gmatch("|") do pipe_count = pipe_count + 1 end
-                    if pipe_count >= 2 then
-                        return true  -- 合法的 WordPress 登录 cookie（已URL解码）
+                    if pipe_count >= 3 then
+                        return true  -- 合法的 WordPress 登录 cookie（user|expiry|token|hmac 共3个|）
                     end
                 end
                 -- 兼容：部分环境 setcookie 不编码，直接检查原始值中的 |
                 local raw_pipe_count = 0
                 for _ in cookie_val:gmatch("|") do raw_pipe_count = raw_pipe_count + 1 end
-                if raw_pipe_count >= 2 then
+                if raw_pipe_count >= 3 then
                     return true  -- 合法的 WordPress 登录 cookie（原始值含 |）
                 end
             end
@@ -1307,10 +1323,13 @@ local function is_logged_user()
     -- 攻击者可轻易伪造以绕过 WAF 检测，仅 wordpress_logged_in_ / wordpress_sec_ 视为已登录
     return false
 end
-local function fully_decode(str)
+--  自适应递归解码 URI 编码，防御多重编码攻击（如 %2565 -> %65 -> e）
+--  log_event: 可选，达到最大迭代次数时的日志事件名（区分 URI 和参数来源）
+local function fully_decode(str, log_event)
     if not str or str == "" then
         return str
     end
+    log_event = log_event or "MULTI_ENCODED_URI_DETECTED"
 
     local prev = ""
     local iterations = 0
@@ -1328,9 +1347,9 @@ local function fully_decode(str)
 
     -- 如果达到最大迭代次数仍未稳定，说明可能是攻击载荷，直接判定为可疑
     if iterations >= max_iterations and prev ~= str then
-        log("warn", "MULTI_ENCODED_URI_DETECTED", nil, nil,
-            string.format("uri=%s, iterations=%d (max=%d), possible bypass attempt",
-                str, iterations, max_iterations))
+        log("warn", log_event, nil, nil,
+            string.format("iterations=%d (max=%d), possible bypass attempt",
+                iterations, max_iterations))
         -- 返回原始字符串，让后续检测处理（或标记为可疑）
         return str
     end
@@ -1338,35 +1357,9 @@ local function fully_decode(str)
     return str
 end
 
--- 恶意参数关键字检测
---  自适应递归解码 URI 编码，防御多重编码攻击（如 %2565 -> %65 -> e）
+-- 便捷别名：参数解码（区分日志事件名）。合并自原先独立的 fully_unescape_uri
 local function fully_unescape_uri(s)
-    if not s or s == "" then
-        return s
-    end
-
-    local prev = ""
-    local iterations = 0
-    local max_iterations = 20  -- 安全上限，防止异常输入
-
-    while prev ~= s and iterations < max_iterations do
-        prev = s
-        local ok, decoded = pcall(ngx.unescape_uri, s)
-        if not ok or not decoded or decoded == s then
-            break
-        end
-        s = decoded
-        iterations = iterations + 1
-    end
-
-    -- 如果达到最大迭代次数仍未稳定，可能是攻击载荷
-    if iterations >= max_iterations and prev ~= s then
-        log("warn", "MULTI_ENCODED_PARAM_DETECTED", nil, nil,
-            string.format("param=%s, iterations=%d (max=%d), possible bypass attempt",
-                s, iterations, max_iterations))
-    end
-
-    return s
+    return fully_decode(s, "MULTI_ENCODED_PARAM_DETECTED")
 end
 
 --  优化：已登录用户行为基线检查
@@ -2233,13 +2226,21 @@ local function safe_eval(red, script_tag, script, numkeys, ...)
         if ok and res ~= nil then
             return true, res, nil
         end
-        -- NOSCRIPT：Redis 重启/清理导致脚本丢失，清除缓存以便下次回退 EVAL
-        if err and (err:find("NOSCRIPT", 1, true) or err:find("noscript", 1, true)) then
+        -- EVALSHA 失败：检查是否 NOSCRIPT（脚本丢失），是则回退 EVAL，否则返回错误
+        --  pcall 异常时 ok=false, res=异常信息, err=nil；Redis 返回错误时 res=nil, err=ERR信息
+        local err_msg
+        if not ok then
+            err_msg = tostring(res)               -- Lua 异常（超时/断连/空指针等）
+        else
+            err_msg = tostring(err or "unknown")  -- Redis 返回错误（含 NOSCRIPT）
+        end
+        if err_msg:find("NOSCRIPT", 1, true) or err_msg:find("noscript", 1, true) then
             sha_cache[script_tag] = nil
             ngx.log(ngx.WARN, "[WAF] EVALSHA NOSCRIPT (", script_tag,
-                "), falling back to EVAL, err=", tostring(err))
+                "), falling back to EVAL, err=", err_msg)
+            -- fall through to EVAL fallback
         else
-            return ok, res, err
+            return false, nil, err_msg
         end
     end
     -- 回退 EVAL：无缓存 SHA 或 NOSCRIPT 后重新加载
@@ -2508,11 +2509,20 @@ local function schedule_circuit_breaker_probe()
     if circuit_breaker_probe_scheduled then
         return  -- 已有探测定时器在运行
     end
+    
+    --  共享内存全局标记：防止多个 Worker 同时创建探测定时器
+    if SH_META then
+        if SH_META:get("redis:probe:scheduled") == "1" then
+            return  -- 其他 Worker 已在探测
+        end
+        SH_META:set("redis:probe:scheduled", "1", cfg.redis_probe_interval * 2)
+    end
     circuit_breaker_probe_scheduled = true
     
     local ok, err = ngx.timer.at(cfg.redis_probe_interval, function(premature)
         if premature then
             circuit_breaker_probe_scheduled = false
+            if SH_META then SH_META:delete("redis:probe:scheduled") end
             return
         end
         
@@ -2535,6 +2545,7 @@ local function schedule_circuit_breaker_probe()
                     "background probe succeeded, resetting circuit breaker")
                 reset_circuit_breaker()
                 circuit_breaker_probe_scheduled = false
+                if SH_META then SH_META:delete("redis:probe:scheduled") end
                 return
             end
         else
@@ -2548,18 +2559,35 @@ local function schedule_circuit_breaker_probe()
             log("info", "REDIS_PROBE_RETRY", nil, nil,
                 string.format("probe failed, retrying in %ds", cfg.redis_probe_interval))
             circuit_breaker_probe_scheduled = false
+            if SH_META then SH_META:delete("redis:probe:scheduled") end
             schedule_circuit_breaker_probe()
         else
             -- 熔断已被其他方式重置，停止探测
             circuit_breaker_probe_scheduled = false
+            if SH_META then SH_META:delete("redis:probe:scheduled") end
         end
     end)
     
     if not ok then
         circuit_breaker_probe_scheduled = false
+        if SH_META then SH_META:delete("redis:probe:scheduled") end
         log("error", "REDIS_PROBE_TIMER_FAILED", nil, nil,
             string.format("error=%s", tostring(err or "unknown")))
     end
+end
+
+--  提取熔断器触发逻辑（redis_connect 中 conn/auth/select 三处共享）
+local function trigger_circuit_breaker()
+    if not SH_META then return end
+    local failures = bump_counter(SH_META, "redis:failures", cfg.redis_circuit_breaker_ttl)
+    if failures ~= cfg.redis_max_failures then return end
+    local cb_level = bump_counter(SH_META, "redis:circuit_breaker:level", cfg.redis_circuit_breaker_ttl * 2)
+    local cur_ttl = cfg.redis_circuit_breaker_init_ttl
+    if cb_level >= 3 then cur_ttl = cfg.redis_circuit_breaker_ttl
+    elseif cb_level >= 2 then cur_ttl = cfg.redis_circuit_breaker_init_ttl * 2 end
+    SH_META:set("redis:circuit_breaker:last_open", ngx.now(), cur_ttl * 2)
+    log("error", "REDIS_CIRCUIT_BREAKER_TRIGGERED", nil, nil,
+        string.format("failures=%d level=%d ttl=%ds (step backoff)", failures, cb_level, cur_ttl))
 end
 
 redis_connect = function()
@@ -2603,24 +2631,7 @@ redis_connect = function()
         red:set_timeout(cfg.redis_eval_timeout_ms)
     end
     if not ok then
-        if SH_META then
-            local failures = bump_counter(SH_META, "redis:failures", cfg.redis_circuit_breaker_ttl)
-            -- 当首次达到阈值时，记录熔断开启时间（阶梯退避）
-            if failures == cfg.redis_max_failures then
-                -- 🔧 阶梯退避：根据触发级别计算熔断时长
-                local cb_level = bump_counter(SH_META, "redis:circuit_breaker:level", cfg.redis_circuit_breaker_ttl * 2)
-                local cur_ttl = cfg.redis_circuit_breaker_init_ttl  -- 首次 10s
-                if cb_level >= 3 then
-                    cur_ttl = cfg.redis_circuit_breaker_ttl  -- 持续触发 60s
-                elseif cb_level >= 2 then
-                    cur_ttl = cfg.redis_circuit_breaker_init_ttl * 2  -- 再次 20s
-                end
-                SH_META:set("redis:circuit_breaker:last_open", ngx.now(), cur_ttl * 2)
-                log("error", "REDIS_CIRCUIT_BREAKER_TRIGGERED", nil, nil,
-                    string.format("failures=%d level=%d ttl=%ds (step backoff)",
-                        failures, cb_level, cur_ttl))
-            end
-        end
+        trigger_circuit_breaker()
         
         log("error", "REDIS_CONNECT_FAILED", nil, nil, 
             string.format("host=%s port=%d error=%s", 
@@ -2631,18 +2642,7 @@ redis_connect = function()
     if cfg.redis_pass and cfg.redis_pass ~= "" then
         local ok2, err2 = red:auth(cfg.redis_pass)
         if not ok2 then
-            if SH_META then
-                local failures = bump_counter(SH_META, "redis:failures", cfg.redis_circuit_breaker_ttl)
-                if failures == cfg.redis_max_failures then
-                    local cb_level = bump_counter(SH_META, "redis:circuit_breaker:level", cfg.redis_circuit_breaker_ttl * 2)
-                    local cur_ttl = cfg.redis_circuit_breaker_init_ttl
-                    if cb_level >= 3 then cur_ttl = cfg.redis_circuit_breaker_ttl
-                    elseif cb_level >= 2 then cur_ttl = cfg.redis_circuit_breaker_init_ttl * 2 end
-                    SH_META:set("redis:circuit_breaker:last_open", ngx.now(), cur_ttl * 2)
-                    log("error", "REDIS_CIRCUIT_BREAKER_TRIGGERED", nil, nil,
-                        string.format("failures=%d level=%d ttl=%ds", failures, cb_level, cur_ttl))
-                end
-            end
+            trigger_circuit_breaker()
             
             log("error", "REDIS_AUTH_FAILED", nil, nil, err2 or "unknown")
             pcall(function() red:close() end)
@@ -2653,18 +2653,7 @@ redis_connect = function()
     if cfg.redis_db ~= nil then
         local ok3, err3 = red:select(cfg.redis_db)
         if not ok3 then
-            if SH_META then
-                local failures = bump_counter(SH_META, "redis:failures", cfg.redis_circuit_breaker_ttl)
-                if failures == cfg.redis_max_failures then
-                    local cb_level = bump_counter(SH_META, "redis:circuit_breaker:level", cfg.redis_circuit_breaker_ttl * 2)
-                    local cur_ttl = cfg.redis_circuit_breaker_init_ttl
-                    if cb_level >= 3 then cur_ttl = cfg.redis_circuit_breaker_ttl
-                    elseif cb_level >= 2 then cur_ttl = cfg.redis_circuit_breaker_init_ttl * 2 end
-                    SH_META:set("redis:circuit_breaker:last_open", ngx.now(), cur_ttl * 2)
-                    log("error", "REDIS_CIRCUIT_BREAKER_TRIGGERED", nil, nil,
-                        string.format("failures=%d level=%d ttl=%ds", failures, cb_level, cur_ttl))
-                end
-            end
+            trigger_circuit_breaker()
             
             log("error", "REDIS_SELECT_DB_FAILED", nil, nil, 
                 string.format("db=%d error=%s", cfg.redis_db, err3 or "unknown"))
@@ -4400,6 +4389,7 @@ function _M.log()
         -- 封逻条件（满足任一即封）：
         local should_ban = false
         local ban_reason = "unknown"
+        local ban_ttl = nil  -- should_ban 分支设置，banned_flag 分支优先使用
 
         if miss_n > cfg.miss_window_limit * 2 or bypass_n > cfg.bypass_window_limit * 2 then
             should_ban = true
@@ -4415,7 +4405,7 @@ function _M.log()
 
         if should_ban then
             local ban_key = "wf:ban:" .. ip
-            local ban_ttl = cfg.ban_mid  -- 封禁1小时
+            ban_ttl = cfg.ban_mid  -- 封禁1小时
             red:set(ban_key, ban_reason, "EX", ban_ttl)
             set_local_ban_cache(ip, cfg.local_ban_cache_ttl)
             log("warn", "ORIGIN_ABUSE_BANNED", ip, uri,
@@ -4425,12 +4415,14 @@ function _M.log()
         end
 
         if banned_flag == 1 then
-            local ban_ttl = tonumber(res[6]) or cfg.ban_soft
-            local ban_reason = res[7] or "cache"
+            --  优先使用 should_ban 分支已设置的 ban_ttl/ban_reason，FEEDBACK_SCRIPT 返回值作为备选
+            --    避免 should_ban 设置的正确值被 FEEDBACK_SCRIPT 返回的 0/"" 覆盖
+            local log_ban_ttl = ban_ttl or tonumber(res[6]) or cfg.ban_soft
+            local log_ban_reason = ban_reason or res[7] or "cache"
             set_local_ban_cache(ip, cfg.local_ban_cache_ttl)
             log("warn", "IP_BANNED_FEEDBACK", ip, uri,
                 string.format("score=%d reason=%s cache_status=%s",
-                    current_risk, ban_reason, status))
+                    current_risk, log_ban_reason, status))
         end
 
         redis_close(red)
