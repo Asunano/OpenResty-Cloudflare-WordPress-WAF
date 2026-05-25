@@ -105,6 +105,11 @@ curl "http://your-domain.com/?id=1' union select 1,2,3--"
 # Should return 403 Forbidden
 ```
 
+### 6.Configuration
+
+See [CONFIG_en.md](CONFIG_en.md)
+
+
 ---
 
 ## Architecture Overview
