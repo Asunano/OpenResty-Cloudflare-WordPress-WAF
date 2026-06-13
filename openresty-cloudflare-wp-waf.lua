@@ -736,23 +736,21 @@ local function acquire_distributed_lock(lock_key, ttl)
                 -- 检查锁是否过期（考虑时钟漂移，额外加 2 秒容差）
                 if old_time and (ngx.now() - old_time > ttl + 2) then
                     ngx.log(ngx.WARN, string.format(
-                        "[WAF] 检测到过期锁 %s (pid=%s, age=%.1fs)，强制释放",
+                        "[WAF] 检测到过期锁 %s (pid=%s, age=%.1fs)，尝试获取",
                         lock_key, old_pid, ngx.now() - old_time
                     ))
-                    -- 竞态场景：锁在检查过期后、删除前刚好过期，其他 worker 获取了新锁
-                    safe_release_distributed_lock(lock_key, old_lock)
-                    --  过期锁重试（最多 3 次）：极端并发下其他 worker 可能已抢占
-                    for retry = 1, 3 do
-                        lock_acquired = SH_META:add(lock_key, lock_val, ttl)
-                        if lock_acquired then
-                            ngx.log(ngx.WARN, string.format(
-                                "[WAF] 过期锁 %s 重试%d次后成功获取", lock_key, retry))
-                            break
-                        end
-                    end
-                    if not lock_acquired then
+                    -- 🔧 修复竞态：使用原子 add 尝试获取锁（如果原锁仍存在则失败）
+                    --    如果 add 失败说明其他 worker 已抢占，我们放弃
+                    --    如果 add 成功说明我们是合法的锁持有者（即使旧锁还没删除）
+                    local try_acquired = SH_META:add(lock_key, lock_val, ttl)
+                    if try_acquired then
+                        lock_acquired = true
                         ngx.log(ngx.WARN, string.format(
-                            "[WAF] 过期锁 %s 重试3次失败，被其他 worker 抢占", lock_key))
+                            "[WAF] 过期锁 %s 成功获取（旧锁已过期但未删除）", lock_key))
+                    else
+                        -- add 失败说明其他 worker 抢占了锁，这是正常行为
+                        ngx.log(ngx.DEBUG, string.format(
+                            "[WAF] 过期锁 %s 被其他 worker 抢占，跳过", lock_key))
                     end
                 end
             end
@@ -887,7 +885,9 @@ local function refresh_whitelist_if_needed()
     if (now - whitelist_last_refresh) >= refresh_interval or (global_last_refresh > whitelist_last_refresh) then
         
         local lock_key = "whitelist:refresh:lock"
-        local lock_acquired, lock_val = acquire_distributed_lock(lock_key, 10)
+        -- 🔧 动态 TTL：锁的过期时间应至少为刷新间隔的一半，避免刷新过程中锁过期
+        local lock_ttl = math.max(30, math.floor(refresh_interval / 2))
+        local lock_acquired, lock_val = acquire_distributed_lock(lock_key, lock_ttl)
 
         local ok, err = xpcall(function()
             -- 双重检查：再次从全局共享内存字典核实
@@ -1305,15 +1305,33 @@ local function is_logged_user()
                 local ok_unescape, decoded_val = pcall(ngx.unescape_uri, cookie_val)
                 if ok_unescape and decoded_val then
                     --  严格匹配 WordPress 登录 cookie 格式：user|expiry|token|hmac
-                    local user, expiry, token, hmac = decoded_val:match("^(.-)|(%d+)|(%w+)|(%x+)$")
+                    -- 🔧 修复：原正则 %x+ 只匹配16进制，但HMAC可能是64字符SHA256
+                    --    且用户名可能包含特殊字符，改用更健壮的匹配策略
+                    local user, expiry, token, hmac = decoded_val:match("^([^|]+)|(%d+)|(%w+)|(%x+)$")
+                    if not user or not hmac or #hmac < 32 then
+                        -- 尝试宽松匹配：HMAC可能是任意长度十六进制串
+                        user, expiry, token, hmac = decoded_val:match("^([^|]+)|(%d+)|(%w+)|([%x]+)$")
+                    end
                     if user and expiry and token and hmac then
-                        return true
+                        -- 验证 expiry 是合理的时间戳（当前时间前后1年内）
+                        local expiry_ts = tonumber(expiry) or 0
+                        local now_ts = os.time()
+                        if expiry_ts > now_ts - 31536000 and expiry_ts < now_ts + 31536000 then
+                            return true
+                        end
                     end
                 end
                 -- 兼容：部分环境 setcookie 不编码，直接检查原始值中的 |
-                local user2, expiry2, token2, hmac2 = cookie_val:match("^(.-)|(%d+)|(%w+)|(%x+)$")
+                local user2, expiry2, token2, hmac2 = cookie_val:match("^([^|]+)|(%d+)|(%w+)|(%x+)$")
+                if not user2 or not hmac2 or #hmac2 < 32 then
+                    user2, expiry2, token2, hmac2 = cookie_val:match("^([^|]+)|(%d+)|(%w+)|([%x]+)$")
+                end
                 if user2 and expiry2 and token2 and hmac2 then
-                    return true
+                    local expiry_ts = tonumber(expiry2) or 0
+                    local now_ts = os.time()
+                    if expiry_ts > now_ts - 31536000 and expiry_ts < now_ts + 31536000 then
+                        return true
+                    end
                 end
             end
         end
@@ -2666,14 +2684,10 @@ redis_connect = function()
     end
     
     local red = redis:new()
-    -- 🔧 双阶梯超时：connect 短超时快速失败，eval 长超时给 Redis 计算时间
+    -- 🔧 双阶梯超时：connect 短超时快速失败，auth/select 用中等超时，eval 用长超时
     red:set_timeout(cfg.redis_connect_timeout_ms)
 
     local ok, err = red:connect(cfg.redis_host, cfg.redis_port)
-    -- connect 成功后切换为 eval 超时
-    if ok then
-        red:set_timeout(cfg.redis_eval_timeout_ms)
-    end
     if not ok then
         trigger_circuit_breaker()
         
@@ -2683,6 +2697,12 @@ redis_connect = function()
         return nil, err
     end
 
+    -- 🔧 连接成功后切换为中等超时（用于 auth 和 select 命令）
+    --    auth/select 通常很快，但网络抖动时需要适当容错
+    local cmd_timeout = math.max(cfg.redis_connect_timeout_ms, 100)  -- 至少 100ms
+    red:set_timeout(cmd_timeout)
+
+    -- 执行认证
     if cfg.redis_pass and cfg.redis_pass ~= "" then
         local ok2, err2 = red:auth(cfg.redis_pass)
         if not ok2 then
@@ -2694,6 +2714,7 @@ redis_connect = function()
         end
     end
 
+    -- 选择数据库
     if cfg.redis_db ~= nil then
         local ok3, err3 = red:select(cfg.redis_db)
         if not ok3 then
@@ -2705,6 +2726,10 @@ redis_connect = function()
             return nil, err3
         end
     end
+    
+    -- 🔧 命令执行完成后，切换为 eval 超时（用于复杂 Lua 脚本）
+    red:set_timeout(cfg.redis_eval_timeout_ms)
+
     if SH_META then
         SH_META:delete("redis:failures")
         SH_META:delete("redis:circuit_breaker:last_open")
@@ -2826,7 +2851,9 @@ local function ensure_whitelist_fresh()
     -- 文件白名单只在worker启动时加载一次，不需要定期刷新
     -- 此函数仅用于Redis动态白名单的刷新
     if wl_last_reload == 0 or (now() - wl_last_reload) >= cfg.whitelist_refresh_interval then
-        local lock_acquired, lock_val = acquire_distributed_lock("wl:reload_lock", 30)
+        -- 🔧 修复：锁 TTL 应至少为刷新间隔的一半，确保刷新操作有足够时间完成
+        local lock_ttl = math.max(30, math.floor(cfg.whitelist_refresh_interval / 2))
+        local lock_acquired, lock_val = acquire_distributed_lock("wl:reload_lock", lock_ttl)
         if not lock_acquired then
             return
         end
@@ -3468,32 +3495,81 @@ local function handle_waf_status(ip)
         add("共享内存", "未初始化")
     end
 
-    --  Redis 连接（一次连接读取全部指标 + 检测状态，避免重复握手）
+    --  Redis 连接（优先复用已有连接，否则创建新连接）
+    -- 🔧 修复：优先尝试复用 ngx.ctx.redis_conn（如果存在且可用）
+    --    否则创建新连接并使用连接池
     local redis_metrics = {}
     local display_ttl = cfg.status_metrics_ttl_days > 0 and (cfg.status_metrics_ttl_days .. "天") or "永久"
-    local r = redis:new()
-    r:set_timeout(200)
-    local ok_r = r:connect(cfg.redis_host, cfg.redis_port)
-    if ok_r then
-        if cfg.redis_pass and cfg.redis_pass ~= "" then
-            r:auth(cfg.redis_pass)
-        end
-        add("Redis状态", "已连接")
-        if cfg.redis_pass and cfg.redis_pass ~= "" then
-            add("Redis认证", "通过")
-        end
-        if SH_META then
-            add("Redis熔断失败数", tonumber(SH_META:get("redis:failures") or 0))
-        end
-        -- 读取独立存储指标
-        pcall(function()
-            redis_metrics.req = tonumber(r:get("wf:status:req_total")) or 0
-            redis_metrics.miss = tonumber(r:get("wf:status:miss")) or 0
-            redis_metrics.bypass = tonumber(r:get("wf:status:bypass")) or 0
-        end)
-        r:close()
+    local r = nil
+    
+    -- 尝试复用当前请求的 Redis 连接（如果可用）
+    if ngx.ctx.redis_conn then
+        r = ngx.ctx.redis_conn
     else
-        add("Redis状态", "不可用")
+        -- 创建新连接并尝试使用连接池
+        r = redis:new()
+        r:set_timeout(200)
+        local ok_r = r:connect(cfg.redis_host, cfg.redis_port)
+        if not ok_r then
+            add("Redis状态", "不可用")
+            r = nil
+        else
+            -- 🔧 修复：新增连接需要认证和选库
+            if cfg.redis_pass and cfg.redis_pass ~= "" then
+                local auth_ok, auth_err = r:auth(cfg.redis_pass)
+                if not auth_ok then
+                    add("Redis状态", "认证失败")
+                    pcall(function() r:close() end)
+                    r = nil
+                end
+            end
+            if r and cfg.redis_db ~= nil then
+                local select_ok, select_err = r:select(cfg.redis_db)
+                if not select_ok then
+                    add("Redis状态", "选库失败")
+                    pcall(function() r:close() end)
+                    r = nil
+                end
+            end
+        end
+    end
+    
+    if r then
+        if cfg.redis_pass and cfg.redis_pass ~= "" then
+            local auth_ok, auth_err = r:auth(cfg.redis_pass)
+            if not auth_ok then
+                add("Redis状态", "认证失败")
+                if not ngx.ctx.redis_conn then
+                    pcall(function() r:close() end)
+                end
+                r = nil
+            end
+        end
+        
+        if r then
+            add("Redis状态", "已连接")
+            if cfg.redis_pass and cfg.redis_pass ~= "" then
+                add("Redis认证", "通过")
+            end
+            if SH_META then
+                add("Redis熔断失败数", tonumber(SH_META:get("redis:failures") or 0))
+            end
+            -- 读取独立存储指标
+            pcall(function()
+                redis_metrics.req = tonumber(r:get("wf:status:req_total")) or 0
+                redis_metrics.miss = tonumber(r:get("wf:status:miss")) or 0
+                redis_metrics.bypass = tonumber(r:get("wf:status:bypass")) or 0
+            end)
+            
+            -- 如果不是复用连接，则关闭或放回连接池
+            if not ngx.ctx.redis_conn then
+                -- 🔧 修复：复用全局 keepalive 配置
+                local ok, err = r:set_keepalive(cfg.redis_keepalive_ms, cfg.redis_keepalive_pool)
+                if not ok then
+                    pcall(function() r:close() end)
+                end
+            end
+        end
     end
     add("Redis统计(" .. display_ttl .. "窗口)", "请求=" .. (redis_metrics.req or 0)
         .. " Miss=" .. (redis_metrics.miss or 0)
